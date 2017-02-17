@@ -9,6 +9,7 @@ from tilequeue.format import json_format, zip_format, topojson_format, \
     mvt_format
 from tilequeue.process import process_coord
 from tilequeue.query import DataFetcher
+from tilequeue.store import write_tile_if_changed
 from tilequeue.tile import calc_meters_per_pixel_dim
 from tilequeue.tile import coord_to_mercator_bounds
 from tilequeue.tile import reproject_lnglat_to_mercator
@@ -345,7 +346,7 @@ class TileServer(object):
             # condition
             if format != json_format:
                 self.io_pool.apply_async(
-                    async_store, (self.store, tile_data, coord, format,
+                    async_store_if_changed, (self.store, tile_data, coord, format,
                                   'all'))
 
             # additionally, we'll want to enqueue the tile onto sqs to
@@ -406,6 +407,16 @@ def async_store(store, tile_data, coord, format, layer):
     """update cache store with tile_data"""
     try:
         store.write_tile(tile_data, coord, format, layer)
+    except:
+        stacktrace = format_stacktrace_one_line()
+        print 'Error storing coord %s with format %s: %s' % (
+            serialize_coord(coord), format.extension, stacktrace)
+
+
+def async_store_if_changed(store, tile_data, coord, format, layer):
+    """update (if_changed) cache store with tile_data"""
+    try:
+        write_tile_if_changed(store, tile_data, coord, format, layer)
     except:
         stacktrace = format_stacktrace_one_line()
         print 'Error storing coord %s with format %s: %s' % (
