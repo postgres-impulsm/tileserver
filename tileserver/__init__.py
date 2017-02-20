@@ -239,18 +239,27 @@ class TileServer(object):
         if request_data is None:
             return self.generate_404(request)
         layer_spec = request_data.layer_spec
-        layer_data = parse_layer_spec(request_data.layer_spec,
-                                      self.layer_config)
+        layer_data = parse_layer_spec(layer_spec, self.layer_config)
         if layer_data is None:
             return self.generate_404(request)
+        coord = request_data.coord
+        format = request_data.format
 
+        tile_data = self.process_request_data(request_data, layer_data)
+
+        response = self.create_response(
+            request, 200, tile_data, format.mimetype)
+
+        return response
+
+    def process_request_data(self, request_data, layer_data):
+        layer_spec = request_data.layer_spec
         coord = request_data.coord
         format = request_data.format
 
         tile_data = self.reformat_from_stored_json(request_data, layer_data)
         if tile_data is not None:
-            return self.create_response(
-                request, 200, tile_data, format.mimetype)
+            return tile_data
 
         # update the tiles of interest set with the coordinate
         if self.redis_cache_index:
@@ -309,9 +318,7 @@ class TileServer(object):
             tile_data = reformat_selected_layers(
                 json_data_all, layer_data, coord, format, self.buffer_cfg)
 
-        response = self.create_response(
-            request, 200, tile_data, format.mimetype)
-        return response
+        return tile_data
 
     def reformat_from_stored_json(self, request_data, layer_data):
         layer_spec = request_data.layer_spec
