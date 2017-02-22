@@ -1,5 +1,6 @@
 from collections import namedtuple
 from cStringIO import StringIO
+from . import first_cache
 from ModestMaps.Core import Coordinate
 from multiprocessing.pool import ThreadPool
 from tilequeue.command import make_queue
@@ -18,6 +19,7 @@ from tilequeue.transform import mercator_point_to_lnglat
 from tilequeue.transform import transform_feature_layers_shape
 from tilequeue.utils import format_stacktrace_one_line
 from tilequeue.metatile import make_single_metatile, extract_metatile
+import threading
 from werkzeug.wrappers import Request
 from werkzeug.wrappers import Response
 import ujson as json
@@ -180,7 +182,15 @@ class TileServer(object):
                  post_process_data, io_pool, store, redis_cache_index,
                  sqs_queue, buffer_cfg, formats, health_checker=None,
                  add_cors_headers=False, metatile_size=None,
-                 metatile_store_originals=False):
+                 metatile_store_originals=False,
+                 first_cache_dir=None,
+                 first_cache_refresh_prob=None,
+                 first_cache_refresh_interval=None,
+                 first_cache_refresh_queue=None,
+                 first_cache_pool=None,
+                 ):
+        self._lock = threading.RLock()
+
         self.layer_config = layer_config
         self.extensions = extensions
         self.data_fetcher = data_fetcher
@@ -198,6 +208,14 @@ class TileServer(object):
             assert self.metatile_size == 1, "Metatile sizes other than 1 " \
                 "are not currently supported."
         self.metatile_store_originals = metatile_store_originals
+
+        self.first_cache_dir = first_cache_dir
+        self.first_cache_refresh_prob = first_cache_refresh_prob
+        self.first_cache_refresh_interval = first_cache_refresh_interval
+        self.first_cache_refresh_queue = first_cache_refresh_queue
+        self.first_cache_refresh_queue_counter = 0
+        self.first_cache_refresh_pool = ThreadPool(1)
+        self.first_cache_write_pool = ThreadPool(1)
 
     def __call__(self, environ, start_response):
         request = Request(environ)
@@ -245,11 +263,35 @@ class TileServer(object):
         coord = request_data.coord
         format = request_data.format
 
-        tile_data = self.process_request_data(request_data, layer_data)
+        cache_path_list = layer_spec, coord.zoom, coord.column, coord.row, format.extension
+        tile_data, tile_age = first_cache.read_first_cache(self.first_cache_dir, cache_path_list)
+
+        if tile_data is None:
+            tile_data = self.process_request_data(request_data, layer_data)
+            def async_write():
+                first_cache.write_first_cache(self.first_cache_dir, cache_path_list, tile_data)
+            self.first_cache_write_pool.apply_async(async_write)
+        elif first_cache.roll_the_dice(
+                    self.first_cache_refresh_prob,
+                    self.first_cache_refresh_interval,
+                    tile_age,
+                ):
+            with self._lock:
+                if self.first_cache_refresh_queue_counter < self.first_cache_refresh_queue:
+                    print('Enqueue to refresh first cache! %r %r' % (
+                        self.first_cache_refresh_queue_counter,
+                        cache_path_list,
+                    ))
+                    def async_refresh():
+                        with self._lock:
+                            self.first_cache_refresh_queue_counter -= 1
+                        fresh_tile_data = self.process_request_data(request_data, layer_data)
+                        first_cache.write_first_cache(self.first_cache_dir, cache_path_list, fresh_tile_data)
+                    self.first_cache_refresh_queue_counter += 1
+                    self.first_cache_refresh_pool.apply_async(async_refresh)
 
         response = self.create_response(
             request, 200, tile_data, format.mimetype)
-
         return response
 
     def process_request_data(self, request_data, layer_data):
@@ -604,11 +646,38 @@ def create_tileserver_from_config(config):
         metatile_store_originals = metatile_config.get(
             'store_metatile_and_originals')
 
+    first_cache_dir = config.get(
+        'first_cache_dir',
+        os.path.join(os.path.dirname(__file__), '..', 'first-cache'),
+    )
+    first_cache_refresh_prob = config.get(
+        'first_cache_refresh_prob',
+        10,
+    )
+    first_cache_refresh_interval = config.get(
+        'first_cache_refresh_interval',
+        604800,
+    )
+    first_cache_refresh_queue = config.get(
+        'first_cache_refresh_queue',
+        3,
+    )
+
+    assert isinstance(first_cache_dir, (unicode, bytes))
+    assert isinstance(first_cache_refresh_prob, (int, long, float))
+    assert isinstance(first_cache_refresh_interval, (int, long, float))
+    assert isinstance(first_cache_refresh_queue, (int, long))
+
     tile_server = TileServer(
         layer_config, extensions, data_fetcher, post_process_data, io_pool,
         store, redis_cache_index, sqs_queue, buffer_cfg, formats,
         health_checker, add_cors_headers, metatile_size,
-        metatile_store_originals)
+        metatile_store_originals,
+        first_cache_dir=first_cache_dir,
+        first_cache_refresh_prob=first_cache_refresh_prob,
+        first_cache_refresh_interval=first_cache_refresh_interval,
+        first_cache_refresh_queue=first_cache_refresh_queue,
+    )
     return tile_server
 
 
